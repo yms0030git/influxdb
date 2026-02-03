@@ -18,6 +18,9 @@ on:
         description: 'CPython 版本 (如 3.13.11)'
         required: false
         default: '3.13.11'
+      artifact_run_id:
+        description: '填某次 Run 的 ID 则跳过构建，直接用该次的 tarball 打镜像并推送（Run 页 URL 里的数字）'
+        required: false
 
 env:
   RUST_BACKTRACE: '1'
@@ -28,6 +31,7 @@ env:
 jobs:
   build-release:
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event.inputs.artifact_run_id == '' || github.event.inputs.artifact_run_id == null
     defaults:
       run:
         working-directory: /tmp/workspace
@@ -110,19 +114,60 @@ jobs:
   build-and-push-docker:
     runs-on: ubuntu-latest
     needs: build-release
-    if: ${{ github.event_name != 'pull_request' }}
+    if: ${{ github.event_name != 'pull_request' && (github.event.inputs.artifact_run_id == '' || github.event.inputs.artifact_run_id == null) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download tarball artifact
+      - name: Download tarball artifact (current run)
         uses: actions/download-artifact@v4
         with:
           name: influxdb3-core-${{ env.TARGET }}
 
       - name: Prepare Docker build context
         run: |
-          cp influxdb3-core-${{ env.TARGET }}/influxdb3-core_${{ env.TARGET }}.tar.gz influxdb3-core.tar.gz
+          cp "$(find . -name 'influxdb3-core_*.tar.gz' -type f | head -1)" influxdb3-core.tar.gz
+          cp .github/docker/entrypoint.sh .
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: .github/docker/Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/influxdb3-core-obs:3.8.0
+            ${{ secrets.DOCKERHUB_USERNAME }}/influxdb3-core-obs:latest
+          build-args: TARBALL=influxdb3-core.tar.gz
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # 仅手动触发且填写 artifact_run_id 时运行：用指定 Run 的 tarball 打镜像，不重新构建
+  build-and-push-docker-from-run:
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.artifact_run_id != '' && github.event.inputs.artifact_run_id != null }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download tarball artifact (from specified run)
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          run_id: ${{ github.event.inputs.artifact_run_id }}
+          name: influxdb3-core-${{ env.TARGET }}
+
+      - name: Prepare Docker build context
+        run: |
+          cp "$(find . -name 'influxdb3-core_*.tar.gz' -type f | head -1)" influxdb3-core.tar.gz
           cp .github/docker/entrypoint.sh .
 
       - name: Set up Docker Buildx
