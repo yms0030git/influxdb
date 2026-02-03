@@ -74,8 +74,10 @@ jobs:
           echo "PYO3_CROSS_PYTHON_VERSION=3.13" >> $GITHUB_ENV
           echo "LD_LIBRARY_PATH=/tmp/workspace/python-artifacts/${{ env.TARGET }}/python/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
 
-      - name: Install patchelf
-        run: sudo apt-get update && sudo apt-get install -y patchelf
+      - name: Install build deps (protoc, patchelf)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler patchelf
 
       - name: Cargo release build
         run: |
