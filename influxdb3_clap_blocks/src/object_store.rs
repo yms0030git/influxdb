@@ -507,6 +507,18 @@ macro_rules! object_store_config_inner {
                 )]
                 pub aws_endpoint: Option<Endpoint>,
 
+                /// Use virtual-hosted-style requests for S3 (bucket in host instead of path).
+                /// Required for providers that disable path-style (e.g. Huawei OBS). When true,
+                /// set `--aws-endpoint` to the bucket endpoint, e.g.
+                /// `https://bucket.obs.region.myhuaweicloud.com`.
+                #[clap(
+                    id = gen_name!($prefix, "aws-virtual-hosted-style"),
+                    long = gen_name!($prefix, "aws-virtual-hosted-style"),
+                    env = gen_env!($prefix, "AWS_VIRTUAL_HOSTED_STYLE"),
+                    action
+                )]
+                pub aws_virtual_hosted_style: bool,
+
                 /// When using Amazon S3 as an object store, set this to the session token. This is handy when using a federated
                 /// login / SSO and you fetch credentials via the UI.
                 ///
@@ -762,6 +774,7 @@ macro_rules! object_store_config_inner {
                         aws_allow_http: Default::default(),
                         aws_default_region: FALLBACK_AWS_REGION.to_string(),
                         aws_endpoint: Default::default(),
+                        aws_virtual_hosted_style: Default::default(),
                         aws_secret_access_key: Default::default(),
                         aws_session_token: Default::default(),
                         aws_skip_signature: Default::default(),
@@ -907,6 +920,9 @@ macro_rules! object_store_config_inner {
                     }
                     if let Some(endpoint) = &self.aws_endpoint {
                         builder = builder.with_endpoint(endpoint.clone());
+                    }
+                    if self.aws_virtual_hosted_style {
+                        builder = builder.with_virtual_hosted_style_request(true);
                     }
 
                     Ok(builder)

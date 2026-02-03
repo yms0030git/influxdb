@@ -1,0 +1,103 @@
+# 云原生编译打包：基于 v3.8.0 + 华为 OBS 支持，产出 influxdb3-core_<target>.tar.gz
+# 触发：推送到 main / release/** / build/** 或 Actions 页手动 Run workflow
+# 产物：Artifacts 中 influxdb3-core-x86_64-unknown-linux-gnu（内含 .tar.gz）
+name: Build InfluxDB 3 Core (release tarball)
+
+on:
+  push:
+    branches: [main, 'release/**', 'build/**']
+  workflow_dispatch:
+    inputs:
+      pbs_date:
+        description: 'Python Build Standalone 发布日期 (与 .circleci 一致可用 20251205)'
+        required: false
+        default: '20251205'
+      pbs_version:
+        description: 'CPython 版本 (如 3.13.11)'
+        required: false
+        default: '3.13.11'
+
+env:
+  RUST_BACKTRACE: '1'
+  CARGO_INCREMENTAL: '0'
+  CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+  TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: /tmp/workspace
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare workspace
+        run: |
+          cp -a "$GITHUB_WORKSPACE" /tmp/workspace
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.91
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            /tmp/workspace/target
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Fetch Python Build Standalone
+        env:
+          PBS_DATE: ${{ github.event.inputs.pbs_date || '20251205' }}
+          PBS_VERSION: ${{ github.event.inputs.pbs_version || '3.13.11' }}
+        run: |
+          ./.circleci/scripts/fetch-python-standalone.bash python-artifacts "$PBS_DATE" "$PBS_VERSION"
+
+      - name: Extract Python for target
+        run: |
+          tar -C /tmp/workspace/python-artifacts -zxvf /tmp/workspace/python-artifacts/all.tar.gz ./${{ env.TARGET }}
+
+      - name: Setup PYO3 env
+        run: |
+          rustup target add ${{ env.TARGET }}
+          echo "PYO3_CONFIG_FILE=/tmp/workspace/python-artifacts/${{ env.TARGET }}/pyo3_config_file.txt" >> $GITHUB_ENV
+          echo "PYO3_CROSS_PYTHON_VERSION=3.13" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=/tmp/workspace/python-artifacts/${{ env.TARGET }}/python/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+
+      - name: Install patchelf
+        run: sudo apt-get update && sudo apt-get install -y patchelf
+
+      - name: Cargo release build
+        run: |
+          cargo build --release --target ${{ env.TARGET }} --workspace
+        env:
+          PYO3_CONFIG_FILE: /tmp/workspace/python-artifacts/${{ env.TARGET }}/pyo3_config_file.txt
+
+      - name: Adjust RPATH (Linux)
+        run: |
+          patchelf --set-rpath '$ORIGIN/python/lib:$ORIGIN/../lib/influxdb3/python/lib' \
+            "/tmp/workspace/target/${{ env.TARGET }}/release/influxdb3"
+
+      - name: Create tarball
+        run: |
+          mkdir -p artifacts
+          tar -cvf artifacts/influxdb3-core_${{ env.TARGET }}.tar \
+            -C "/tmp/workspace/target/${{ env.TARGET }}/release" influxdb3
+          tar -rvf artifacts/influxdb3-core_${{ env.TARGET }}.tar \
+            -C "/tmp/workspace/python-artifacts/${{ env.TARGET }}" python
+          gzip -f artifacts/influxdb3-core_${{ env.TARGET }}.tar
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: influxdb3-core-${{ env.TARGET }}
+          path: /tmp/workspace/artifacts/
