@@ -16,7 +16,8 @@ RUN groupadd --gid 1500 influxdb3 && \
 # CI 将 tarball 以固定名传入构建上下文
 ARG TARBALL=influxdb3-core.tar.gz
 COPY ${TARBALL} /tmp/influxdb3-core.tar.gz
-RUN tar --strip-components 1 -C /usr/lib/influxdb3 -xzf /tmp/influxdb3-core.tar.gz && \
+# tarball 顶层即为 influxdb3 + python/，不解掉一层
+RUN tar -xzf /tmp/influxdb3-core.tar.gz -C /usr/lib/influxdb3 && \
     mv /usr/lib/influxdb3/influxdb3 /usr/bin/influxdb3 && \
     chown -R influxdb3:influxdb3 /var/lib/influxdb3 /plugins && \
     chown -R root:root /usr/lib/influxdb3 && \
