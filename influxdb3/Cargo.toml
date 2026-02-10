@@ -20,6 +20,7 @@ workspace = true
 # Core Crates
 authz.workspace = true
 clap_builder.workspace = true
+datafusion.workspace = true
 datafusion_util.workspace = true
 iox_query.workspace = true
 iox_time.workspace = true

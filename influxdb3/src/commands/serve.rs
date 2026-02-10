@@ -45,7 +45,7 @@ use influxdb3_write::{
     retention_period_handler::RetentionPeriodHandler,
     table_index_cache::TableIndexCacheConfig,
     write_buffer::{
-        ReadOnlyWriteBuffer, WriteBufferImpl, WriteBufferImplArgs,
+        read_only_write_buffer::ReadOnlyWriteBuffer, WriteBufferImpl, WriteBufferImplArgs,
         check_mem_and_force_snapshot_loop, persisted_files::PersistedFiles,
     },
 };
@@ -970,7 +970,8 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
             warn!("TableIndexCache initialization failed, continuing in degraded state.");
             warn!("Without TableIndexCache, object store cleanup for retention policies and hard deletes will temporarily be unable to proceed; compacted data and queries should not be affected.");
         })
-    .unwrap_or(None);
+    .unwrap_or(None)
+    .map(Arc::new);
 
     if config.read_only && table_index_cache.is_none() {
         return Err(Error::WriteBufferInit(anyhow::anyhow!(
@@ -1123,7 +1124,7 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
                 &write_buffer_impl,
             )
             .await;
-            (Arc::new(write_buffer_impl), Some(persisted_files))
+            (write_buffer_impl, Some(persisted_files))
         };
 
     info!("setting up telemetry store");
