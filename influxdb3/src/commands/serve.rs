@@ -1085,7 +1085,7 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
                 object_store_url,
                 last_cache,
                 distinct_cache,
-                config.query_file_limit,
+                config.query_file_limit.unwrap_or(432),
             );
             (Arc::new(ro), None)
         } else {
