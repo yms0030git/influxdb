@@ -15,9 +15,10 @@ use influxdb3_id::{DbId, TableId};
 use influxdb3_wal::{
     SnapshotDetails, SnapshotSequenceNumber, Wal, WalFileSequenceNumber, WalOp,
 };
+use iox_query::QueryChunk;
 use object_store::ObjectStore;
+use observability_deps::tracing::warn;
 use tokio::sync::oneshot;
-use tracing::warn;
 
 use crate::{
     BufferedWriteRequest, Bufferer, ChunkContainer, ChunkFilter, DistinctCacheManager, LastCacheManager,
