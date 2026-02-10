@@ -19,6 +19,9 @@ use crate::{
 
 #[derive(Debug, Error)]
 pub enum TableIndexError {
+    #[error("Table index not found in object store (read-only replica: start Writer first?)")]
+    NotFound,
+
     #[error("Failed to load table index from object store")]
     LoadIndex(#[source] object_store::Error),
 
@@ -297,9 +300,13 @@ impl CoreTableIndex {
         Ok(())
     }
 
+    /// Load table index from object store.
+    ///
+    /// When `create_if_not_found` is false (read-only replica), returns `TableIndexError::NotFound` if the index does not exist.
     pub(crate) async fn from_object_store(
         object_store: Arc<dyn ObjectStore>,
         path: &TableIndexPath,
+        create_if_not_found: bool,
     ) -> Result<Self> {
         let mut found = false;
 
@@ -317,6 +324,9 @@ impl CoreTableIndex {
                 serde_json::from_slice(&index_bytes).map_err(TableIndexError::DeserializeIndex)?
             }
             Err(object_store::Error::NotFound { .. }) => {
+                if !create_if_not_found {
+                    return Err(TableIndexError::NotFound);
+                }
                 // Create empty CoreTableIndex if not found
                 Self {
                     id: path.full_table_id(),
@@ -333,7 +343,7 @@ impl CoreTableIndex {
             .update_from_object_store(Arc::clone(&object_store), 10)
             .await?;
 
-        // If the index didn't exist before, persist it now
+        // If the index didn't exist before, persist it now (writer only)
         if !found {
             let json = serde_json::to_vec_pretty(&table_index)
                 .map_err(TableIndexError::DeserializeIndex)?;
@@ -1864,7 +1874,7 @@ pub(crate) mod test_table_index_operations {
         }
 
         // Load from object store
-        let loaded = CoreTableIndex::from_object_store(Arc::clone(&object_store), &path)
+        let loaded = CoreTableIndex::from_object_store(Arc::clone(&object_store), &path, true)
             .await
             .expect("loading from object store should succeed");
 
@@ -1887,7 +1897,7 @@ pub(crate) mod test_table_index_operations {
             .unwrap();
 
         // Try to load from object store and expect an error
-        let result = CoreTableIndex::from_object_store(Arc::clone(&object_store), &path).await;
+        let result = CoreTableIndex::from_object_store(Arc::clone(&object_store), &path, true).await;
 
         assert!(result.is_err(), "Expected an error but got success");
         let err = result.unwrap_err();
@@ -1931,7 +1941,7 @@ pub(crate) mod test_table_index_operations {
             .unwrap();
 
         // Try to load from object store and expect an error
-        let result = CoreTableIndex::from_object_store(Arc::clone(&object_store), &path).await;
+        let result = CoreTableIndex::from_object_store(Arc::clone(&object_store), &path, true).await;
 
         assert!(result.is_err(), "Expected an error but got success");
         let err = result.unwrap_err();

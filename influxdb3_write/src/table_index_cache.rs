@@ -126,6 +126,8 @@ pub struct TableIndexCacheConfig {
     pub max_entries: Option<usize>,
     /// Limit the concurrency of cache <-> object store operations.
     pub concurrency_limit: usize,
+    /// When true (read-only replica), do not create or put table index in OBS when not found.
+    pub read_only: bool,
 }
 
 impl Default for TableIndexCacheConfig {
@@ -133,6 +135,7 @@ impl Default for TableIndexCacheConfig {
         Self {
             max_entries: None,
             concurrency_limit: 20,
+            read_only: false,
         }
     }
 }
@@ -605,9 +608,11 @@ impl TableIndexCache {
             table_id.db_id().get(),
             table_id.table_id().get(),
         );
+        let create_if_not_found = !self.inner.config.read_only;
         let index = CoreTableIndex::from_object_store(
             Arc::clone(&self.inner.object_store),
             &table_index_path,
+            create_if_not_found,
         )
         .await
         .map_err(TableIndexCacheError::LoadTableIndexFromObjectStoreError)?;
@@ -1028,9 +1033,11 @@ impl TableIndexCache {
                 table_id.db_id().get(),
                 table_id.table_id().get(),
             );
+            let create_if_not_found = !self.inner.config.read_only;
             let index = CoreTableIndex::from_object_store(
                 Arc::clone(&self.inner.object_store),
                 &table_index_path,
+                create_if_not_found,
             )
             .await
             .map_err(TableIndexCacheError::CreateTableIndexFromObjectStoreError)?;

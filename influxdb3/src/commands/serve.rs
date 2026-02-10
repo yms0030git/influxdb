@@ -37,15 +37,16 @@ use influxdb3_telemetry::{
     store::{CreateTelemetryStoreArgs, TelemetryStore},
 };
 use influxdb3_wal::{Gen1Duration, WalConfig};
+use datafusion::execution::object_store::ObjectStoreUrl;
 use influxdb3_write::table_index_cache::TableIndexCache;
 use influxdb3_write::{
     WriteBuffer, deleter,
-    persister::Persister,
+    persister::{self, Persister},
     retention_period_handler::RetentionPeriodHandler,
     table_index_cache::TableIndexCacheConfig,
     write_buffer::{
-        WriteBufferImpl, WriteBufferImplArgs, check_mem_and_force_snapshot_loop,
-        persisted_files::PersistedFiles,
+        ReadOnlyWriteBuffer, WriteBufferImpl, WriteBufferImplArgs,
+        check_mem_and_force_snapshot_loop, persisted_files::PersistedFiles,
     },
 };
 use iox_query::exec::{DedicatedExecutor, Executor, ExecutorConfig, PerQueryMemoryPoolConfig};
@@ -349,6 +350,18 @@ pub struct Config {
 
     #[clap(flatten)]
     pub node_id: NodeId,
+
+    /// Catalog path prefix in object store (cluster: same for Writer and Readers). If unset, uses node-id (single-node).
+    #[clap(long = "catalog-prefix", env = "INFLUXDB3_CATALOG_PREFIX", action)]
+    pub catalog_prefix: Option<String>,
+
+    /// Data node ID for read path (cluster: Writer's node-id). Readers set this to Writer's node-id; if unset, uses node-id.
+    #[clap(long = "data-node-id", env = "INFLUXDB3_DATA_NODE_ID", action)]
+    pub data_node_id: Option<String>,
+
+    /// Run as read-only replica (no WriteBuffer, Persister, Retention, Deleter; catalog sync from OBS).
+    #[clap(long = "read-only", env = "INFLUXDB3_READ_ONLY", default_value_t = false, action)]
+    pub read_only: bool,
 
     /// Maximum number of table indices to cache in memory.
     ///
@@ -894,6 +907,13 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
         )
         .with_jaeger_debug_name(config.tracing_config.traces_jaeger_debug_name);
 
+    // Data path prefix: for readers use Writer's node-id (data_node_id); for Writer use node_id.
+    let data_path_prefix = config
+        .data_node_id
+        .as_deref()
+        .unwrap_or(node_id.as_str())
+        .to_string();
+
     // Create table index cache configuration from CLI arguments
     let table_index_cache_config = TableIndexCacheConfig {
         max_entries: if config.table_index_cache_max_entries == 0 {
@@ -902,36 +922,48 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
             Some(config.table_index_cache_max_entries)
         },
         concurrency_limit: config.table_index_cache_concurrency_limit,
+        read_only: config.read_only,
     };
 
-    let persister = Arc::new(Persister::new(
-        Arc::clone(&object_store),
-        node_id.as_str(),
-        Arc::clone(&time_provider) as _,
-    ));
+    let persister = if config.read_only {
+        None
+    } else {
+        Some(Arc::new(Persister::new(
+            Arc::clone(&object_store),
+            node_id.as_str(),
+            Arc::clone(&time_provider) as _,
+        )))
+    };
 
     let process_uuid_getter: Arc<dyn ProcessUuidGetter> = Arc::new(ProcessUuidWrapper::new());
-    let catalog = Catalog::new_with_shutdown(
+    let catalog_prefix = config
+        .catalog_prefix
+        .as_deref()
+        .map(std::sync::Arc::from);
+    let catalog = Catalog::new_with_shutdown_opts(
         node_id.as_str(),
+        catalog_prefix,
         Arc::clone(&object_store),
         Arc::clone(&time_provider),
         Arc::clone(&metrics),
         shutdown_manager.register(),
         Arc::clone(&process_uuid_getter),
+        config.read_only,
     )
     .await
     .map_err(Error::InitializeCatalog)?;
     info!(catalog_uuid = ?catalog.catalog_uuid(), "catalog initialized");
 
     let retention_handler_token = shutdown_manager.register();
-    let _table_index_cache = initialize_table_index_cache(
-        node_id.clone(),
+    let table_index_cache = initialize_table_index_cache(
+        data_path_prefix.clone(),
         config.retention_check_interval.into(),
         table_index_cache_config,
         Arc::clone(&object_store),
         Arc::clone(&catalog),
         Arc::clone(&time_provider) as _,
         retention_handler_token,
+        config.read_only,
     )
     .await
         .inspect_err(|_e| {
@@ -939,6 +971,12 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
             warn!("Without TableIndexCache, object store cleanup for retention policies and hard deletes will temporarily be unable to proceed; compacted data and queries should not be affected.");
         })
     .unwrap_or(None);
+
+    if config.read_only && table_index_cache.is_none() {
+        return Err(Error::WriteBufferInit(anyhow::anyhow!(
+            "Read-only mode requires TableIndexCache; initialization failed"
+        )));
+    }
 
     // Initialize tokens from files if provided and auth is enabled
     if !config.without_auth {
@@ -954,20 +992,31 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
     // Capture and filter CLI parameters
     let cli_params = cli_params::capture_cli_params(user_params);
 
-    let _ = catalog
-        .register_node(
-            &node_id,
-            num_cpus as u64,
-            vec![influxdb3_catalog::log::NodeMode::Core],
-            process_uuid_getter,
-            Some(cli_params),
-        )
-        .await
-        .map_err(Error::InitializeCatalog)?;
-    let node_def = catalog
-        .node(&node_id)
-        .expect("node should be registered in catalog");
-    info!(instance_id = ?node_def.instance_id(), "catalog initialized");
+    if !config.read_only {
+        let _ = catalog
+            .register_node(
+                &node_id,
+                num_cpus as u64,
+                vec![influxdb3_catalog::log::NodeMode::Core],
+                process_uuid_getter,
+                Some(cli_params),
+            )
+            .await
+            .map_err(Error::InitializeCatalog)?;
+        info!("catalog initialized (Writer)");
+    } else {
+        info!("catalog initialized (read-only replica)");
+    }
+
+    let instance_id: Arc<str> = if config.read_only {
+        Arc::from(format!("reader-{}", uuid::Uuid::new_v4()))
+    } else {
+        let node_def = catalog
+            .node(&node_id)
+            .expect("node should be registered in catalog");
+        node_def.instance_id()
+    };
+    info!(instance_id = %instance_id, "instance id");
 
     let last_cache = LastCacheProvider::new_from_catalog_with_background_eviction(
         Arc::clone(&catalog),
@@ -984,27 +1033,31 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
     .await
     .map_err(Error::InitializeDistinctCache)?;
 
-    // Set the gen1 duration in the catalog; if already set, nothing happens; if set to a different
-    // value, we emit a WARN; if some other error occurs we exit.
-    let gen1_duration = match catalog
-        .set_gen1_duration(config.gen1_duration.as_duration())
-        .await
-    {
-        Ok(_) | Err(CatalogError::AlreadyExists) => config.gen1_duration,
-        Err(CatalogError::CannotChangeGenerationDuration { .. }) => {
-            let existing: Gen1Duration = catalog
-                .get_generation_duration(1)
-                .unwrap()
-                .try_into()
-                .expect("catalog should contain valid gen1 duration");
-            warn!(
-                existing_secs = existing.as_duration().as_secs(),
-                provided_secs = config.gen1_duration.as_duration().as_secs(),
-                "cannot change the existing gen1 duration after it has been set"
-            );
-            existing
+    // Set the gen1 duration in the catalog (Writer only); if already set, nothing happens.
+    // Readers use catalog loaded from OBS and do not write catalog.
+    let gen1_duration = if config.read_only {
+        config.gen1_duration
+    } else {
+        match catalog
+            .set_gen1_duration(config.gen1_duration.as_duration())
+            .await
+        {
+            Ok(_) | Err(CatalogError::AlreadyExists) => config.gen1_duration,
+            Err(CatalogError::CannotChangeGenerationDuration { .. }) => {
+                let existing: Gen1Duration = catalog
+                    .get_generation_duration(1)
+                    .unwrap()
+                    .try_into()
+                    .expect("catalog should contain valid gen1 duration");
+                warn!(
+                    existing_secs = existing.as_duration().as_secs(),
+                    provided_secs = config.gen1_duration.as_duration().as_secs(),
+                    "cannot change the existing gen1 duration after it has been set"
+                );
+                existing
+            }
+            Err(error) => return Err(Error::InitializeCatalog(error)),
         }
-        Err(error) => return Err(Error::InitializeCatalog(error)),
     };
 
     let n_snapshots_to_load_on_start =
@@ -1018,52 +1071,67 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
         wal_replay_fail_on_error: config.wal_replay_fail_on_error,
     };
 
-    let write_buffer_impl = WriteBufferImpl::new(WriteBufferImplArgs {
-        persister: Arc::clone(&persister),
-        catalog: Arc::clone(&catalog),
-        last_cache,
-        distinct_cache,
-        time_provider: Arc::clone(&time_provider),
-        executor: Arc::clone(&write_path_executor),
-        wal_config,
-        parquet_cache,
-        metric_registry: Arc::clone(&metrics),
-        snapshotted_wal_files_to_keep: config.snapshotted_wal_files_to_keep,
-        query_file_limit: config.query_file_limit,
-        n_snapshots_to_load_on_start: n_snapshots_to_load_on_start as usize,
-        shutdown: shutdown_manager.register(),
-        wal_replay_concurrency_limit: config.wal_replay_concurrency_limit,
-    })
-    .await
-    .map_err(|e| Error::WriteBufferInit(e.into()))?;
-
-    let persisted_files = write_buffer_impl.persisted_files();
-
-    let object_deleter = Some(Arc::clone(&persisted_files) as _);
-
-    deleter::run(
-        DeleteManagerArgs {
-            catalog: Arc::clone(&catalog),
-            time_provider: Arc::clone(&time_provider),
-            object_deleter,
-            delete_grace_period: *config.delete_grace_period,
-        },
-        shutdown_manager.register(),
-    );
-
-    info!("setting up background mem check for query buffer");
-    background_buffer_checker(
-        config.force_snapshot_mem_threshold.as_num_bytes(),
-        &write_buffer_impl,
-    )
-    .await;
+    let (write_buffer, persisted_files): (Arc<dyn WriteBuffer>, Option<Arc<PersistedFiles>>) =
+        if config.read_only {
+            let table_index_cache = table_index_cache.as_ref().expect("required for read_only");
+            let object_store_url =
+                ObjectStoreUrl::parse(persister::DEFAULT_OBJECT_STORE_URL).unwrap();
+            let ro = ReadOnlyWriteBuffer::new(
+                Arc::clone(&catalog),
+                Arc::clone(table_index_cache),
+                data_path_prefix.clone(),
+                Arc::clone(&object_store),
+                object_store_url,
+                last_cache,
+                distinct_cache,
+                config.query_file_limit,
+            );
+            (Arc::new(ro), None)
+        } else {
+            let write_buffer_impl = WriteBufferImpl::new(WriteBufferImplArgs {
+                persister: Arc::clone(persister.as_ref().unwrap()),
+                catalog: Arc::clone(&catalog),
+                last_cache,
+                distinct_cache,
+                time_provider: Arc::clone(&time_provider),
+                executor: Arc::clone(&write_path_executor),
+                wal_config,
+                parquet_cache,
+                metric_registry: Arc::clone(&metrics),
+                snapshotted_wal_files_to_keep: config.snapshotted_wal_files_to_keep,
+                query_file_limit: config.query_file_limit,
+                n_snapshots_to_load_on_start: n_snapshots_to_load_on_start as usize,
+                shutdown: shutdown_manager.register(),
+                wal_replay_concurrency_limit: config.wal_replay_concurrency_limit,
+            })
+            .await
+            .map_err(|e| Error::WriteBufferInit(e.into()))?;
+            let persisted_files = write_buffer_impl.persisted_files();
+            let object_deleter = Some(Arc::clone(&persisted_files) as _);
+            deleter::run(
+                DeleteManagerArgs {
+                    catalog: Arc::clone(&catalog),
+                    time_provider: Arc::clone(&time_provider),
+                    object_deleter,
+                    delete_grace_period: *config.delete_grace_period,
+                },
+                shutdown_manager.register(),
+            );
+            info!("setting up background mem check for query buffer");
+            background_buffer_checker(
+                config.force_snapshot_mem_threshold.as_num_bytes(),
+                &write_buffer_impl,
+            )
+            .await;
+            (Arc::new(write_buffer_impl), Some(persisted_files))
+        };
 
     info!("setting up telemetry store");
     let telemetry_store = setup_telemetry_store(TelemetryStoreSetupArgs {
         object_store_config: &config.object_store_config,
-        instance_id: node_def.instance_id(),
+        instance_id,
         num_cpus,
-        persisted_files: Some(persisted_files),
+        persisted_files,
         telemetry_endpoint: &config.telemetry_endpoint,
         disable_upload: config.disable_telemetry_upload,
         serve_invocation_method: config.serve_invocation_method,
@@ -1071,8 +1139,6 @@ pub async fn command(config: Config, user_params: HashMap<String, String>) -> Re
         processing_engine_metrics: Arc::clone(&catalog) as Arc<dyn ProcessingEngineMetrics>,
     })
     .await;
-
-    let write_buffer: Arc<dyn WriteBuffer> = write_buffer_impl;
 
     let common_state = CommonServerState::new(
         Arc::clone(&catalog),
@@ -1392,6 +1458,7 @@ async fn initialize_table_index_cache(
     catalog: Arc<Catalog>,
     time_provider: Arc<dyn TimeProvider>,
     retention_handler_token: ShutdownToken,
+    read_only: bool,
 ) -> Result<Option<TableIndexCache>> {
     let table_index_cache = TableIndexCache::new(
         node_id.clone(),
@@ -1403,6 +1470,7 @@ async fn initialize_table_index_cache(
         node_id = node_id.clone(),
         max_entries = ?table_index_cache_config.max_entries,
         concurrency_limit = table_index_cache_config.concurrency_limit,
+        read_only,
         "Initializing table index cache"
     );
 
@@ -1419,20 +1487,22 @@ async fn initialize_table_index_cache(
         ))
     })?;
 
-    // Create and start the retention period handler
-    let retention_handler = Arc::new(RetentionPeriodHandler::new(
-        table_index_cache.clone(),
-        Arc::clone(&catalog),
-        Arc::clone(&time_provider) as _,
-        retention_check_interval,
-        node_id.to_string(),
-    ));
+    if !read_only {
+        // Create and start the retention period handler (Writer only)
+        let retention_handler = Arc::new(RetentionPeriodHandler::new(
+            table_index_cache.clone(),
+            Arc::clone(&catalog),
+            Arc::clone(&time_provider) as _,
+            retention_check_interval,
+            node_id.to_string(),
+        ));
 
-    tokio::spawn(async move {
-        retention_handler
-            .background_task(retention_handler_token)
-            .await
-    });
+        tokio::spawn(async move {
+            retention_handler
+                .background_task(retention_handler_token)
+                .await
+        });
+    }
 
     Ok(Some(table_index_cache))
 }

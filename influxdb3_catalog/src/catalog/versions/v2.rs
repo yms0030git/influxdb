@@ -173,45 +173,68 @@ impl Catalog {
     ) -> Result<Self> {
         Self::new_with_args(
             node_id,
+            None,
             store,
             time_provider,
             metric_registry,
             CatalogArgs::default(),
             CatalogLimits::default(),
+            false,
         )
         .await
     }
 
+    /// Create catalog with optional cluster settings for one-writer-many-reader.
+    ///
+    /// - `catalog_prefix`: OBS path prefix for catalog files. If `None`, uses `node_id` (single-node).
+    /// - `load_only`: If true, only load existing catalog from OBS; do not create or create_internal_db. Use for read replicas.
     pub async fn new_with_args(
         node_id: impl Into<Arc<str>>,
+        catalog_prefix: Option<Arc<str>>,
         store: Arc<dyn ObjectStore>,
         time_provider: Arc<dyn TimeProvider>,
         metric_registry: Arc<Registry>,
         args: CatalogArgs,
         limits: CatalogLimits,
+        load_only: bool,
     ) -> Result<Self> {
         let node_id = node_id.into();
+        let prefix = catalog_prefix
+            .as_ref()
+            .map(Arc::clone)
+            .unwrap_or_else(|| Arc::clone(&node_id));
         let store =
-            ObjectStoreCatalog::new(Arc::clone(&node_id), CATALOG_CHECKPOINT_INTERVAL, store);
+            ObjectStoreCatalog::new(prefix, CATALOG_CHECKPOINT_INTERVAL, store);
         let subscriptions = Default::default();
         let metrics = Arc::new(CatalogMetrics::new(&metric_registry));
-        let catalog = store
-            .load_or_create_catalog()
-            .await
-            .map(RwLock::new)
-            .map(|inner| Self {
-                metric_registry,
-                state: parking_lot::Mutex::new(CatalogState::Active),
-                subscriptions,
-                time_provider,
-                store,
-                metrics,
-                inner,
-                limits,
-                args,
-            })?;
+        let catalog = if load_only {
+            let inner = store
+                .load_catalog()
+                .await?
+                .ok_or_else(|| {
+                    CatalogError::NotFound(
+                        "catalog not found in object store (start Writer first?)".into(),
+                    )
+                })?;
+            RwLock::new(inner)
+        } else {
+            RwLock::new(store.load_or_create_catalog().await?)
+        };
+        let catalog = Self {
+            metric_registry,
+            state: parking_lot::Mutex::new(CatalogState::Active),
+            subscriptions,
+            time_provider,
+            store,
+            metrics,
+            inner: catalog,
+            limits,
+            args,
+        };
 
-        create_internal_db(&catalog).await;
+        if !load_only {
+            create_internal_db(&catalog).await;
+        }
 
         catalog.metrics.operation_observer(
             catalog
@@ -230,27 +253,64 @@ impl Catalog {
         shutdown_token: ShutdownToken,
         process_uuid_getter: Arc<dyn ProcessUuidGetter>,
     ) -> Result<Arc<Self>> {
+        Self::new_with_shutdown_opts(
+            node_id,
+            None,
+            store,
+            time_provider,
+            metric_registry,
+            shutdown_token,
+            process_uuid_getter,
+            false,
+        )
+        .await
+    }
+
+    /// Shutdown-enabled constructor with optional cluster options (catalog_prefix, load_only).
+    pub async fn new_with_shutdown_opts(
+        node_id: impl Into<Arc<str>>,
+        catalog_prefix: Option<Arc<str>>,
+        store: Arc<dyn ObjectStore>,
+        time_provider: Arc<dyn TimeProvider>,
+        metric_registry: Arc<Registry>,
+        shutdown_token: ShutdownToken,
+        process_uuid_getter: Arc<dyn ProcessUuidGetter>,
+        load_only: bool,
+    ) -> Result<Arc<Self>> {
         let node_id = node_id.into();
-        let catalog =
-            Arc::new(Self::new(Arc::clone(&node_id), store, time_provider, metric_registry).await?);
-        let catalog_cloned = Arc::clone(&catalog);
-        tokio::spawn(async move {
-            shutdown_token.wait_for_shutdown().await;
-            info!(
-                node_id = node_id.as_ref(),
-                "updating node state to stopped in catalog"
-            );
-            if let Err(error) = catalog_cloned
-                .update_node_state_stopped(node_id.as_ref(), process_uuid_getter)
-                .await
-            {
-                error!(
-                    ?error,
+        let catalog = Arc::new(
+            Self::new_with_args(
+                Arc::clone(&node_id),
+                catalog_prefix,
+                store,
+                time_provider,
+                metric_registry,
+                CatalogArgs::default(),
+                CatalogLimits::default(),
+                load_only,
+            )
+            .await?,
+        );
+        if !load_only {
+            let catalog_cloned = Arc::clone(&catalog);
+            tokio::spawn(async move {
+                shutdown_token.wait_for_shutdown().await;
+                info!(
                     node_id = node_id.as_ref(),
-                    "encountered error while updating node to stopped state in catalog"
+                    "updating node state to stopped in catalog"
                 );
-            }
-        });
+                if let Err(error) = catalog_cloned
+                    .update_node_state_stopped(node_id.as_ref(), process_uuid_getter)
+                    .await
+                {
+                    error!(
+                        ?error,
+                        node_id = node_id.as_ref(),
+                        "encountered error while updating node to stopped state in catalog"
+                    );
+                }
+            });
+        }
         Ok(catalog)
     }
 
@@ -809,11 +869,13 @@ impl Catalog {
         let metric_registry = Default::default();
         Self::new_with_args(
             catalog_id.into(),
+            None,
             store,
             time_provider,
             metric_registry,
             args,
             limits,
+            false,
         )
         .await
     }

@@ -3,6 +3,7 @@
 mod metrics;
 pub mod persisted_files;
 pub mod queryable_buffer;
+pub mod read_only_write_buffer;
 mod table_buffer;
 use influxdb3_shutdown::ShutdownToken;
 use tokio::sync::{oneshot, watch::Receiver};
@@ -134,6 +135,9 @@ pub enum Error {
 
     #[error("cannot write to a compactor-only server")]
     NoWriteInCompactorOnly,
+
+    #[error("cannot write to a read-only replica")]
+    ReadOnlyReplica,
 
     #[error("error: {0}")]
     AnyhowError(#[from] anyhow::Error),
