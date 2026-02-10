@@ -1,7 +1,7 @@
 # 云原生编译打包 + 推送 Docker Hub
 # 1) 构建 influxdb3-core tarball  2) 用 tarball 打 Docker 镜像并推送到 Docker Hub
 # 触发：推送到 main / release/** / build/** 或 Actions 页手动 Run workflow
-# 产物：Artifact 中 .tar.gz；镜像 <DOCKERHUB_USERNAME>/influxdb3-core-obs:3.8.0 与 :latest
+# 产物：Artifact 中 .tar.gz；镜像 <DOCKERHUB_USERNAME>/influxdb3-core-obs:3.8.1 与 :latest
 # 需在仓库 Settings > Secrets 中配置：DOCKERHUB_USERNAME、DOCKERHUB_TOKEN
 name: Build InfluxDB 3 Core + Push to Docker Hub
 
@@ -145,7 +145,7 @@ jobs:
           file: .github/docker/Dockerfile
           push: true
           tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/influxdb3-core-obs:3.8.0
+            ${{ secrets.DOCKERHUB_USERNAME }}/influxdb3-core-obs:3.8.1
             ${{ secrets.DOCKERHUB_USERNAME }}/influxdb3-core-obs:latest
           build-args: TARBALL=influxdb3-core.tar.gz
           cache-from: type=gha
@@ -186,7 +186,7 @@ jobs:
           file: .github/docker/Dockerfile
           push: true
           tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/influxdb3-core-obs:3.8.0
+            ${{ secrets.DOCKERHUB_USERNAME }}/influxdb3-core-obs:3.8.1
             ${{ secrets.DOCKERHUB_USERNAME }}/influxdb3-core-obs:latest
           build-args: TARBALL=influxdb3-core.tar.gz
           cache-from: type=gha
