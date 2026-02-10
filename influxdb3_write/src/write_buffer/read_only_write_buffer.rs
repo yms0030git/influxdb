@@ -23,13 +23,12 @@ use tokio::sync::oneshot;
 use crate::{
     BufferedWriteRequest, Bufferer, ChunkContainer, ChunkFilter, DistinctCacheManager, LastCacheManager,
     ParquetFile, PersistedSnapshotVersion, Precision, WriteBuffer,
-    table_index::TableIndex,
     table_index_cache::{TableIndexCache, TableIndexCacheError},
 };
 use super::parquet_chunk_from_file;
 
 /// No-op WAL for read-only replicas (no writes).
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct NoOpWal;
 
 #[async_trait]
